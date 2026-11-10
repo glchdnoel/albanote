@@ -141,3 +141,11 @@ th{color:var(--muted);font-weight:500}
 .plus{color:var(--accent)} .minus-t{color:var(--warn)}
 .addx{margin-top:6px;font-size:13px}
 .filein{display:none}
+[hidden]{display:none!important}
+input::-webkit-outer-spin-button,input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+input[type=number]{-moz-appearance:textfield}
+.tsel{display:flex;gap:6px}
+.tsel select{flex:1;min-width:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 8px;font-size:16px;font-variant-numeric:tabular-nums}
+.f select:disabled,.f input:disabled{opacity:.6}
+.rule.ended{opacity:.55}
+.joblist + .primary{margin-bottom:4px}

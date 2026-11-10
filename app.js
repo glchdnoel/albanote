@@ -4,7 +4,12 @@
 /* ---------- 기본 설정 ---------- */
 const KEY = 'albanote.v1';
 const PALETTE = ['#2F7D5B', '#C2573A', '#3B6EA8', '#9A6BB8', '#C9952B', '#4A9A9A', '#B5476E', '#6B7A3A'];
-const DEFAULT_RATES = { pension: 4.75, health: 3.595, ltc: 13.14, emp: 0.9 }; // 2026년 근로자 부담분
+// 4대보험 근로자 부담률(%). 연도가 바뀌면 여기에 한 줄 추가. ltc = 건강보험료 대비 장기요양 비율
+const RATE_TABLE = [
+  { from: '2027-01', pension: 5.0, health: 3.595, ltc: 13.90, emp: 0.9, note: '고용보험은 2027년 요율 발표 전이라 2026년 값 사용' },
+  { from: '2026-01', pension: 4.75, health: 3.595, ltc: 13.14, emp: 0.9 }
+];
+const ratesFor = month => RATE_TABLE.find(r => month >= r.from) || RATE_TABLE[RATE_TABLE.length - 1];
 const MIN_WAGE = [{ from: '2027-01-01', wage: 10700 }, { from: '2026-01-01', wage: 10320 }];
 const DED_LABEL = { none: '공제 없음', '33': '3.3%', ins: '4대보험' };
 const BACKUP_REMIND_DAYS = 14;
@@ -45,11 +50,15 @@ function clean(d) {
     }));
   const extras = (Array.isArray(d.extras) ? d.extras : []).filter(x => x && RX.id.test(x.id) && ids.has(x.jobId) && RX.month.test(x.month))
     .slice(0, 5000).map(x => ({ id: x.id, jobId: x.jobId, month: x.month, kind: x.kind === 'minus' ? 'minus' : 'plus', label: str(x.label, 30) || '기타', amount: Math.round(num(x.amount, 0, 0, 1e9)) }));
-  const r = d.rates || {};
-  const rates = { pension: num(r.pension, DEFAULT_RATES.pension, 0, 50), health: num(r.health, DEFAULT_RATES.health, 0, 50), ltc: num(r.ltc, DEFAULT_RATES.ltc, 0, 100), emp: num(r.emp, DEFAULT_RATES.emp, 0, 50) };
-  return { jobs, shifts, extras, rates, lastBackup: RX.date.test(d.lastBackup) ? d.lastBackup : null };
+  const repeats = (Array.isArray(d.repeats) ? d.repeats : []).filter(r => r && RX.id.test(r.id) && ids.has(r.jobId) && RX.date.test(r.from)
+    && RX.time.test(r.start) && RX.time.test(r.end) && (r.until == null || RX.date.test(r.until))).slice(0, 500).map(r => ({
+      id: r.id, jobId: r.jobId, from: r.from, until: r.until || null, start: r.start, end: r.end,
+      breakMin: Math.round(num(r.breakMin, 0, 0, 1440)), holiday: !!r.holiday,
+      skip: (Array.isArray(r.skip) ? r.skip : []).filter(x => RX.date.test(x)).slice(0, 2000)
+    }));
+  return { jobs, shifts, extras, repeats, lastBackup: RX.date.test(d.lastBackup) ? d.lastBackup : null };
 }
-const emptyData = () => ({ jobs: [], shifts: [], extras: [], rates: { ...DEFAULT_RATES }, lastBackup: null });
+const emptyData = () => ({ jobs: [], shifts: [], extras: [], repeats: [], lastBackup: null });
 
 /* ---------- 저장소 ---------- */
 let storageOK = true;
@@ -68,6 +77,32 @@ try { navigator.storage && navigator.storage.persist && navigator.storage.persis
 const now = new Date();
 const view = { y: now.getFullYear(), m: now.getMonth(), tab: 'cal' };
 const jobById = id => S.jobs.find(j => j.id === id);
+const addDays = (ds, n) => { const d = parseYMD(ds); return ymd(new Date(d.getFullYear(), d.getMonth(), d.getDate() + n)); };
+const WK = '일월화수목금토';
+const digits = v => Number(String(v ?? '').replace(/[^0-9]/g, '')) || 0;
+
+/* ---------- 반복 근무 ---------- */
+// 반복 규칙 하나를 a~b 날짜 사이의 실제 근무들로 펼침 (매주 같은 요일)
+function occurrences(rule, a, b) {
+  const out = [], lo = rule.from > a ? rule.from : a, hi = rule.until && rule.until < b ? rule.until : b;
+  if (lo > hi) return out;
+  const diff = Math.round((parseYMD(lo) - parseYMD(rule.from)) / 864e5);
+  for (let ds = addDays(lo, (7 - diff % 7) % 7); ds <= hi; ds = addDays(ds, 7)) {
+    if (rule.skip.includes(ds)) continue;
+    out.push({ id: `r~${rule.id}~${ds}`, ruleId: rule.id, jobId: rule.jobId, date: ds, start: rule.start, end: rule.end,
+      breakMin: rule.breakMin, holiday: rule.holiday, absent: false, memo: '' });
+  }
+  return out;
+}
+// 직접 입력한 근무 + 반복 근무
+function shiftsBetween(a, b) {
+  return S.shifts.filter(s => s.date >= a && s.date <= b).concat(...S.repeats.map(r => occurrences(r, a, b)));
+}
+function findShift(id) {
+  if (!id.startsWith('r~')) return S.shifts.find(s => s.id === id);
+  const [, rid, ds] = id.split('~'), rule = S.repeats.find(r => r.id === rid);
+  return rule ? occurrences(rule, ds, ds)[0] : null;
+}
 
 /* ---------- 계산 ---------- */
 // 근무 1건: 근무시간·야간시간·기본급·가산수당
@@ -99,7 +134,7 @@ function weeksEndingInMonth(y, m) {
 // 주휴수당: 주 15시간 이상 + 결근 없음 → (주 근로시간, 최대 40) ÷ 40 × 8 × 시급
 function juhyuForWeek(job, mon) {
   const days = []; for (let i = 0; i < 7; i++) days.push(ymd(new Date(mon.getFullYear(), mon.getMonth(), mon.getDate() + i)));
-  const ss = S.shifts.filter(s => s.jobId === job.id && days.includes(s.date));
+  const ss = shiftsBetween(days[0], days[6]).filter(s => s.jobId === job.id);
   if (!ss.length) return null;
   let min = 0, absent = false;
   ss.forEach(s => { if (s.absent) absent = true; else min += calcShift(s, job).work; });
@@ -111,20 +146,21 @@ function juhyuForWeek(job, mon) {
   else pay = Math.min(hours, 40) / 40 * 8 * job.wage;
   return { mon: days[0], sun: days[6], hours, pay, reason };
 }
-function deduct(gross, type, r) {
+function deduct(gross, type, month) {
+  const r = ratesFor(month);
   if (type === '33') {
     const tax = t10(gross * 0.03), loc = t10(tax * 0.1);
     return { items: [['소득세 3%', tax], ['지방소득세 0.3%', loc]], sum: tax + loc };
   }
   if (type === 'ins') {
     const p = t10(gross * r.pension / 100), h = t10(gross * r.health / 100), l = t10(h * r.ltc / 100), e = t10(gross * r.emp / 100);
-    return { items: [[`국민연금 ${r.pension}%`, p], [`건강보험 ${r.health}%`, h], [`장기요양 (건보료×${r.ltc}%)`, l], [`고용보험 ${r.emp}%`, e]], sum: p + h + l + e };
+    return { items: [[`국민연금 (${r.pension}%)`, p], [`건강보험 (${r.health}%)`, h], [`장기요양보험 (건강보험료의 ${r.ltc}%)`, l], [`고용보험 (${r.emp}%)`, e]], sum: p + h + l + e };
   }
   return { items: [], sum: 0 };
 }
 function monthJob(job, y, m) {
   const mk = `${y}-${pad(m + 1)}`;
-  const ss = S.shifts.filter(s => s.jobId === job.id && s.date.startsWith(mk));
+  const ss = shiftsBetween(mk + '-01', mk + '-31').filter(s => s.jobId === job.id);
   const r = { work: 0, base: 0, night: 0, ot: 0, hol: 0, absentDays: 0, dates: new Set(), belowMin: false };
   ss.forEach(s => {
     if (s.absent) { r.absentDays++; return; }
@@ -138,7 +174,7 @@ function monthJob(job, y, m) {
   r.plus = r.extras.filter(x => x.kind === 'plus').reduce((a, x) => a + x.amount, 0);   // 상여·수당 → 세전에 포함
   r.minus = r.extras.filter(x => x.kind === 'minus').reduce((a, x) => a + x.amount, 0); // 가불 등 → 실수령에서 차감
   r.gross = Math.round(r.base + r.night + r.ot + r.hol + r.juhyu + r.plus);
-  r.ded = deduct(r.gross, job.deduct, S.rates);
+  r.ded = deduct(r.gross, job.deduct, mk);
   r.net = r.gross - r.ded.sum - r.minus;
   return r;
 }
@@ -180,10 +216,10 @@ function render() {
 }
 function renderBanner() {
   let h = '';
-  if (!storageOK) h = '<div class="warn">이 브라우저에서는 데이터 저장이 막혀 있어요. 창을 닫으면 입력한 내용이 사라지니, 설정 › 백업으로 저장해 두세요.</div>';
-  else if (S.shifts.length) {
+  if (!storageOK) h = '<div class="warn">이 브라우저에서는 데이터 저장이 막혀 있어요. 창을 닫으면 입력한 내용이 사라지니, 설정 › 기록 보관하기에서 저장해 두세요.</div>';
+  else if (S.shifts.length || S.repeats.length) {
     const days = S.lastBackup ? (now - parseYMD(S.lastBackup)) / 864e5 : Infinity;
-    if (days > BACKUP_REMIND_DAYS) h = `<div class="warn">${S.lastBackup ? `마지막 백업이 ${Math.floor(days)}일 전이에요.` : '아직 백업한 적이 없어요.'} 설정 › 백업에서 파일로 저장해 두세요.</div>`;
+    if (days > BACKUP_REMIND_DAYS) h = `<div class="warn">${S.lastBackup ? `마지막 백업이 ${Math.floor(days)}일 전이에요.` : '아직 백업한 적이 없어요.'} 설정 › 기록 보관하기에서 파일로 저장해 두세요.</div>`;
   }
   $('#banner').innerHTML = h;
 }
@@ -213,11 +249,12 @@ function renderCal() {
     const w = juhyuForWeek(j, mon); if (w && w.pay > 0) juhyuBySun[w.sun] = (juhyuBySun[w.sun] || 0) + w.pay;
   }));
   const paydays = paydaysInMonth(y, m);
+  const monthShifts = shiftsBetween(`${y}-${pad(m + 1)}-01`, `${y}-${pad(m + 1)}-${pad(last)}`);
   let h = '<div class="dow">' + ['일', '월', '화', '수', '목', '금', '토'].map((d, i) => `<span class="${i === 0 ? 'sun' : i === 6 ? 'sat' : ''}">${d}</span>`).join('') + '</div><div class="grid">';
   for (let i = 0; i < first; i++) h += '<div class="cell empty"></div>';
   for (let d = 1; d <= last; d++) {
     const ds = `${y}-${pad(m + 1)}-${pad(d)}`, dow = (first + d - 1) % 7, future = ds > today;
-    const ss = S.shifts.filter(s => s.date === ds && jobById(s.jobId)).sort((a, b) => a.start.localeCompare(b.start));
+    const ss = monthShifts.filter(s => s.date === ds && jobById(s.jobId)).sort((a, b) => a.start.localeCompare(b.start));
     let chips = ss.slice(0, 3).map(s => {
       const j = jobById(s.jobId), c = calcShift(s, j);
       return `<div class="chip ${future ? 'plan' : ''} ${s.absent ? 'abs' : ''}" style="--c:${j.color}">${s.absent ? '결근' : short(c.pay)}</div>`;
@@ -279,47 +316,64 @@ function renderJobs() {
       <div class="meta"><b>${esc(j.name)}</b><small>시급 ${j.wage.toLocaleString()}원 · ${j.size5 ? '5인 이상' : '5인 미만'} · ${DED_LABEL[j.deduct]} · ${j.payNext ? '익월' : '당월'} ${j.payday}일 지급</small></div>
       <button class="small-btn" data-act="editJob" data-id="${esc(j.id)}">수정</button></div>`;
   });
-  return h + '</div><button class="primary block" data-act="newJob">+ 알바 추가</button>';
+  h += '</div><button class="primary block" data-act="newJob">+ 알바 추가</button>';
+  const rules = S.repeats.filter(r => jobById(r.jobId)).sort((a, b) => a.from.localeCompare(b.from));
+  if (rules.length) {
+    const today = ymd(now);
+    h += '<div class="sec-title">반복 근무</div>';
+    rules.forEach(r => {
+      const j = jobById(r.jobId), ended = r.until && r.until < today;
+      h += `<div class="card rule ${ended ? 'ended' : ''}"><span class="dot" style="background:${j.color}"></span>
+        <div class="meta"><b>${esc(j.name)} · 매주 ${WK[parseYMD(r.from).getDay()]}요일 ${r.start}~${r.end}</b>
+        <small>${r.from.replace(/-/g, '.')}부터 · ${r.until ? `${r.until.replace(/-/g, '.')}까지${ended ? ' (끝남)' : ''}` : '끝나는 날 없이 계속'}</small></div>
+        <button class="small-btn" data-act="ruleEnd" data-id="${esc(r.id)}">${r.until ? '종료일 변경' : '끝내기'}</button></div>`;
+    });
+  }
+  return h;
 }
 function renderSettings() {
-  const r = S.rates;
+  const rate = (r, y) => `<div class="r"><span>${y}년</span><span>국민연금 ${r.pension}% · 건강 ${r.health}% · 고용 ${r.emp}%</span></div>`;
   return `
-  <div class="sec-title">백업</div>
+  <div class="sec-title">기록 보관하기</div>
   <div class="card">
-    <div class="note" style="margin:0 0 10px">데이터는 이 기기에만 저장돼요. 폰을 바꾸거나 브라우저 데이터를 지우면 사라지니, 가끔 파일로 저장해 두세요.${S.lastBackup ? ` (마지막 백업 ${S.lastBackup})` : ''}</div>
-    <div class="btns" style="margin-top:0"><button class="primary" data-act="exportFile">파일로 저장</button><button class="ghost" data-act="importFile">파일 불러오기</button></div>
-    <details><summary>파일 저장이 안 될 때: 텍스트로 복사·붙여넣기</summary>
+    <div class="note" style="margin:0 0 12px;font-size:13.5px;color:var(--ink)">
+      입력한 알바·근무 기록은 <b>이 폰 안에만</b> 저장돼요. 폰을 바꾸거나 Safari 기록을 지우면 사라질 수 있어요.<br><br>
+      가끔 <b>기록 파일로 저장하기</b>를 눌러 아이폰 '파일' 앱에 보관해 두면, 나중에 <b>저장한 파일로 되살리기</b>로 그대로 복구할 수 있어요.
+    </div>
+    <button class="primary block" data-act="exportFile">기록 파일로 저장하기</button>
+    <button class="ghost block" style="margin-top:8px" data-act="importFile">저장한 파일로 되살리기</button>
+    <div class="note">${S.lastBackup ? `마지막 저장: ${S.lastBackup.replace(/-/g, '.')}` : '아직 저장한 적 없어요'}</div>
+    <details><summary>파일 저장이 안 될 때 (글자로 복사해 두기)</summary>
+      <div class="note">아래 글자를 통째로 복사해 메모 앱에 붙여넣어 두면 돼요. 되살릴 때는 그 글자를 여기에 붙여넣고 '붙여넣은 기록 되살리기'를 누르세요.</div>
       <label class="f" style="margin-top:8px"><textarea id="bk">${esc(JSON.stringify(S))}</textarea></label>
-      <div class="btns" style="margin-top:0"><button class="ghost" data-act="copyBk">복사</button><button class="ghost" data-act="importBk">붙여넣은 내용 불러오기</button></div>
+      <div class="btns" style="margin-top:0"><button class="ghost" data-act="copyBk">복사</button><button class="ghost" data-act="importBk">붙여넣은 기록 되살리기</button></div>
     </details>
   </div>
-  <div class="sec-title">4대보험 요율 (근로자 부담, %)</div>
+  <div class="sec-title">세금·4대보험</div>
   <div class="card">
-    <div class="row2">
-      <label class="f"><span>국민연금</span><input type="number" step="0.001" id="rPension" value="${r.pension}"></label>
-      <label class="f"><span>건강보험</span><input type="number" step="0.001" id="rHealth" value="${r.health}"></label>
-      <label class="f"><span>장기요양 (건보료 대비)</span><input type="number" step="0.01" id="rLtc" value="${r.ltc}"></label>
-      <label class="f"><span>고용보험</span><input type="number" step="0.01" id="rEmp" value="${r.emp}"></label>
-    </div>
-    <div class="btns"><button class="ghost" data-act="resetRates">2026년 기본값</button><button class="primary" data-act="saveRates">요율 저장</button></div>
-    <div class="note">국민연금은 2033년까지 매년 0.5%p씩 오를 예정이라, 해가 바뀌면 여기서 고쳐주세요.</div>
+    <div class="note" style="margin:0 0 6px;font-size:13.5px;color:var(--ink)">따로 설정할 건 없어요. 알바마다 '떼는 돈'만 고르면, 해마다 바뀌는 비율은 앱이 알아서 적용해요.</div>
+    <details><summary>적용 중인 4대보험 비율 보기</summary>
+      <div class="rows" style="margin-top:6px">${RATE_TABLE.map(r => rate(r, r.from.slice(0, 4))).join('')}</div>
+      <div class="note">장기요양보험은 건강보험료에 비율을 곱해요 (2026년 13.14%, 2027년 13.90%). 2027년 고용보험은 아직 발표 전이라 2026년 값으로 계산해요.</div>
+    </details>
   </div>
-  <div class="sec-title">기타</div>
+  <div class="sec-title">처음부터 다시</div>
   <div class="card">
-    <button class="ghost block" data-act="sample">예시 데이터 넣기</button>
-    <button class="ghost danger block" style="margin-top:8px" data-act="wipe">모든 데이터 지우기</button>
+    <button class="ghost block" data-act="sample">예시 데이터 넣어보기</button>
+    <button class="ghost danger block" style="margin-top:8px" data-act="wipe">모든 기록 지우기</button>
   </div>
-  <div class="sec-title">계산 기준</div>
-  <div class="card note" style="margin-top:0">
-    · 주휴수당: 주(월~일) 15시간 이상이고 결근이 없으면 (주 근로시간, 최대 40) ÷ 40 × 8 × 시급<br>
-    · 야간(22~06시)·연장(하루 8시간 초과)·휴일 +50%, 휴일 8시간 초과 +100% — 5인 이상 사업장만<br>
-    · 3.3%: 소득세 3% + 지방소득세 0.3%, 10원 미만 절사<br>
-    · 4대보험: 세전 합계 × 요율, 장기요양은 건강보험료 × 요율. 근로소득세·보험료 상하한은 미반영<br>
-    · 상여·수당은 세전에 더하고, 가불은 실수령에서 빼요<br>
-    · 최저시급: 2026년 10,320원, 2027년 10,700원
+  <div class="sec-title">급여는 이렇게 계산해요</div>
+  <div class="card note" style="margin-top:0;font-size:13px;line-height:1.7">
+    · <b>기본급</b> = 일한 시간(휴게 빼고) × 시급<br>
+    · <b>주휴수당</b>: 월~일 한 주에 15시간 이상 일하고 빠진 날이 없으면 하루치 정도를 더 받아요 (주 40시간이면 8시간분)<br>
+    · <b>야간·연장·휴일수당</b>: 직원 5명 이상인 가게만 받아요. 밤 10시~새벽 6시, 하루 8시간 넘게, 휴일에 일한 시간은 시급의 1.5배<br>
+    · <b>3.3%</b>: 세금 3% + 지방세 0.3%를 떼요<br>
+    · <b>4대보험</b>: 국민연금·건강보험·장기요양·고용보험을 떼요 (근로소득세는 아직 계산에 없어요)<br>
+    · <b>최저시급</b>: 2026년 10,320원, 2027년 10,700원
   </div>
-  <div class="note" style="text-align:center;margin:14px 0">알바노트 v1.0 · 외부 서버 전송 없음</div>`;
+  <div class="note" style="text-align:center;margin:14px 0">알바노트 v1.1 · 기록은 외부로 전송되지 않아요</div>`;
 }
+
 function emptyJobs() {
   return `<div class="empty-state"><b>먼저 알바를 등록해 주세요</b>시급과 급여일을 넣으면 달력에서 바로 계산돼요.<br><br>
     <button class="primary" data-act="newJob">+ 알바 추가</button><br><br>
@@ -334,7 +388,7 @@ function toggle(id, on, label, sub) {
 }
 function openDay(ds) {
   const d = parseYMD(ds), wk = '일월화수목금토'[d.getDay()];
-  const ss = S.shifts.filter(s => s.date === ds && jobById(s.jobId)).sort((a, b) => a.start.localeCompare(b.start));
+  const ss = shiftsBetween(ds, ds).filter(s => jobById(s.jobId)).sort((a, b) => a.start.localeCompare(b.start));
   const pays = paydaysInMonth(d.getFullYear(), d.getMonth())[ds] || [];
   let h = `<h2>${d.getMonth() + 1}월 ${d.getDate()}일 (${wk})</h2>`;
   pays.forEach(p => h += `<div class="payinfo">💰 <b>${esc(p.job.name)}</b> 급여일 · ${p.month}월분 예상 ${won(p.net)}</div>`);
@@ -348,51 +402,92 @@ function openDay(ds) {
     const extra = [c.nightPay && `야간 +${won(c.nightPay)}`, c.otPay && `연장 +${won(c.otPay)}`, c.holPay && `휴일 +${won(c.holPay)}`].filter(Boolean).join(' · ');
     h += `<button class="dayitem" style="--c:${j.color}" data-act="editShift" data-id="${esc(s.id)}">
       <span class="t"><span>${esc(j.name)}</span><span class="num">${s.absent ? '결근' : won(c.pay)}</span></span>
-      <small>${s.start}~${s.end} · ${fmtH(c.work)}${s.breakMin ? ` (휴게 ${s.breakMin}분)` : ''}${s.holiday ? ' · 휴일근무' : ''}</small>
+      <small>${s.start}~${s.end} · ${fmtH(c.work)}${s.breakMin ? ` (휴게 ${s.breakMin}분)` : ''}${s.holiday ? ' · 휴일근무' : ''}${s.ruleId ? ' · 🔁 매주 반복' : ''}</small>
       ${extra ? `<small>${extra}</small>` : ''}${s.memo ? `<small>📝 ${esc(s.memo)}</small>` : ''}</button>`;
   });
   h += `<button class="primary block" data-act="newShift" data-date="${ds}">+ 근무 추가</button>`;
   openSheet(h);
 }
+// 24시간제 시간 선택 (시 00~23, 분 5분 단위)
+function timeSel(id, val) {
+  const [h, m] = (RX.time.test(val) ? val : '09:00').split(':');
+  const mins = Array.from({ length: 12 }, (_, i) => pad(i * 5));
+  if (!mins.includes(m)) mins.push(m), mins.sort();
+  return `<div class="tsel"><select id="${id}H" aria-label="시">${Array.from({ length: 24 }, (_, i) => `<option value="${pad(i)}" ${pad(i) === h ? 'selected' : ''}>${pad(i)}시</option>`).join('')}</select>
+    <select id="${id}M" aria-label="분">${mins.map(x => `<option value="${x}" ${x === m ? 'selected' : ''}>${x}분</option>`).join('')}</select></div>`;
+}
+const readTime = id => `${$('#' + id + 'H').value}:${$('#' + id + 'M').value}`;
+const setTime = (id, v) => { const [h, m] = v.split(':'); $('#' + id + 'H').value = h;
+  const ms = $('#' + id + 'M'); if (![...ms.options].some(o => o.value === m)) ms.add(new Option(m + '분', m)); ms.value = m; };
+const numInput = (id, val, ph = '') => `<input type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="off" id="${id}" value="${val}" placeholder="${ph}">`;
+
 function openShift(date, id) {
   if (!S.jobs.length) { toast('먼저 알바를 등록해 주세요'); return; }
-  const s = id ? S.shifts.find(x => x.id === id) : null;
+  const s = id ? findShift(id) : null;
+  if (id && !s) return;
+  const occ = !!(s && s.ruleId);
   const j0 = s ? jobById(s.jobId) : S.jobs[0];
   const v = s || { jobId: j0.id, date, start: j0.defStart, end: j0.defEnd, breakMin: j0.breakMin, holiday: false, absent: false, memo: '' };
+  let btns;
+  if (occ) btns = `<div class="btns"><button class="primary" data-act="occSave" data-id="${esc(s.id)}">이날만 바꾸기</button><button class="ghost" data-act="occFuture" data-id="${esc(s.id)}">이날부터 모두 바꾸기</button></div>
+      <div class="btns" style="margin-top:8px"><button class="ghost danger" data-act="occSkip" data-id="${esc(s.id)}">이날만 빼기</button><button class="ghost danger" data-act="occEnd" data-id="${esc(s.id)}">이날부터 반복 끝내기</button></div>`;
+  else btns = `<div class="btns">${s ? `<button class="ghost danger" data-act="delShift" data-id="${esc(s.id)}">삭제</button>` : ''}<button class="primary" data-act="saveShift" data-id="${s ? esc(s.id) : ''}">저장</button></div>`;
   openSheet(`<h2>${s ? '근무 수정' : '근무 추가'}</h2>
-    <label class="f"><span>알바</span><select id="sJob">${S.jobs.map(j => `<option value="${esc(j.id)}" ${j.id === v.jobId ? 'selected' : ''}>${esc(j.name)}</option>`).join('')}</select></label>
-    <label class="f"><span>날짜</span><input type="date" id="sDate" value="${v.date}"></label>
-    <div class="row2"><label class="f"><span>출근</span><input type="time" id="sStart" value="${v.start}"></label><label class="f"><span>퇴근</span><input type="time" id="sEnd" value="${v.end}"></label></div>
-    <label class="f"><span>휴게시간 (분)</span><input type="number" inputmode="numeric" id="sBreak" value="${v.breakMin}" min="0" step="10"></label>
-    ${toggle('sHoliday', v.holiday, '휴일 근무', '5인 이상이면 +50% (8시간 초과 +100%)')}
-    ${toggle('sAbsent', v.absent, '결근', '그날 급여 0원, 그 주 주휴수당 없음')}
-    ${s ? '' : `<label class="f"><span>매주 반복</span><select id="sRepeat">${[1, 2, 3, 4, 6, 8, 12].map(n => `<option value="${n}">${n === 1 ? '반복 안 함' : n + '주 동안 같은 요일'}</option>`).join('')}</select></label>`}
-    <label class="f"><span>메모</span><input id="sMemo" value="${esc(v.memo)}" maxlength="200" placeholder="선택"></label>
+    ${occ ? `<div class="payinfo">🔁 매주 ${WK[parseYMD(s.date).getDay()]}요일 반복 근무예요. 이날만 바꿀지, 이날부터 모두 바꿀지 골라주세요.</div>` : ''}
+    <label class="f"><span>알바</span><select id="sJob" ${occ ? 'disabled' : ''}>${S.jobs.map(j => `<option value="${esc(j.id)}" ${j.id === v.jobId ? 'selected' : ''}>${esc(j.name)}</option>`).join('')}</select></label>
+    <label class="f"><span>날짜</span><input type="date" id="sDate" value="${v.date}" ${occ ? 'disabled' : ''}></label>
+    <div class="row2"><div class="f"><span>출근</span>${timeSel('sStart', v.start)}</div><div class="f"><span>퇴근</span>${timeSel('sEnd', v.end)}</div></div>
+    <label class="f"><span>휴게시간 (분)</span>${numInput('sBreak', v.breakMin, '0')}</label>
+    ${toggle('sHoliday', v.holiday, '휴일 근무', '5인 이상이면 시급 1.5배')}
+    ${occ ? '' : toggle('sAbsent', v.absent, '결근', '그날 급여 0원, 그 주 주휴수당 없음')}
+    ${s ? '' : `<label class="f"><span>반복</span><select id="sRepeat"><option value="none">반복 안 함</option><option value="weekly">매주 같은 요일에 반복</option></select></label>
+      <div id="sRepeatOpts" hidden>
+        <label class="f"><span>언제까지 반복할까요?</span><select id="sEndMode"><option value="none">끝나는 날 없이 계속 (나중에 끝낼 수 있어요)</option><option value="date">끝나는 날 정하기</option></select></label>
+        <label class="f" id="sUntilWrap" hidden><span>마지막 근무일</span><input type="date" id="sUntil"></label>
+      </div>`}
+    ${occ ? '' : `<label class="f"><span>메모</span><input id="sMemo" value="${esc(v.memo)}" maxlength="200" placeholder="선택"></label>`}
     <div class="preview" id="sPrev"></div>
-    <div class="btns">${s ? `<button class="ghost danger" data-act="delShift" data-id="${esc(s.id)}">삭제</button>` : ''}<button class="primary" data-act="saveShift" data-id="${s ? esc(s.id) : ''}">저장</button></div>`);
+    ${btns}`);
   $('#sJob').addEventListener('change', () => {
-    if (s) return previewShift();
-    const j = jobById($('#sJob').value);
-    $('#sStart').value = j.defStart; $('#sEnd').value = j.defEnd; $('#sBreak').value = j.breakMin;
+    if (!s) { const j = jobById($('#sJob').value); setTime('sStart', j.defStart); setTime('sEnd', j.defEnd); $('#sBreak').value = j.breakMin; }
     previewShift();
   });
   $('#sheet').oninput = previewShift;
+  $('#sheet').onchange = previewShift;
   previewShift();
 }
 function readShift() {
-  return { jobId: $('#sJob').value, date: $('#sDate').value, start: $('#sStart').value, end: $('#sEnd').value,
-    breakMin: Math.round(num($('#sBreak').value, 0, 0, 1440)), holiday: $('#sHoliday').checked, absent: $('#sAbsent').checked, memo: str($('#sMemo').value.trim(), 200) };
+  return { jobId: $('#sJob').value, date: $('#sDate').value, start: readTime('sStart'), end: readTime('sEnd'),
+    breakMin: Math.min(1440, digits($('#sBreak').value)), holiday: $('#sHoliday').checked,
+    absent: $('#sAbsent') ? $('#sAbsent').checked : false, memo: $('#sMemo') ? str($('#sMemo').value.trim(), 200) : '' };
 }
 function previewShift() {
   const el = $('#sPrev'); if (!el) return;
+  const rep = $('#sRepeat');
+  if (rep) {
+    const weekly = rep.value === 'weekly';
+    $('#sRepeatOpts').hidden = !weekly;
+    $('#sUntilWrap').hidden = !(weekly && $('#sEndMode').value === 'date');
+  }
   const v = readShift(), j = jobById(v.jobId);
-  if (!RX.time.test(v.start) || !RX.time.test(v.end) || !RX.date.test(v.date)) { el.textContent = '날짜와 시간을 입력해 주세요'; return; }
+  if (!RX.date.test(v.date)) { el.textContent = '날짜를 골라주세요'; return; }
   if (v.start === v.end) { el.textContent = '출근과 퇴근 시간이 같아요'; return; }
   if (v.absent) { el.innerHTML = '결근 처리 · <b>0원</b>'; return; }
   const c = calcShift(v, j);
   const extra = [c.nightPay && `야간 +${won(c.nightPay)}`, c.otPay && `연장 +${won(c.otPay)}`, c.holPay && `휴일 +${won(c.holPay)}`].filter(Boolean).join(' · ');
-  el.innerHTML = `${fmtH(c.work)} 근무${c.nightMin >= 1 ? ` · 야간 ${fmtH(c.nightMin)}` : ''}${toMin(v.end) <= toMin(v.start) ? ' · 다음날 퇴근' : ''}<br>예상 <b>${won(c.pay)}</b>${extra ? `<br><small>${extra}</small>` : ''}
+  const repLine = rep && rep.value === 'weekly' ? `<br>🔁 매주 ${WK[parseYMD(v.date).getDay()]}요일 반복` : '';
+  el.innerHTML = `${fmtH(c.work)} 근무${c.nightMin >= 1 ? ` · 야간 ${fmtH(c.nightMin)}` : ''}${toMin(v.end) <= toMin(v.start) ? ' · 다음날 퇴근' : ''}<br>하루 예상 <b>${won(c.pay)}</b>${extra ? `<br><small>${extra}</small>` : ''}${repLine}
     ${j.wage < minWage(v.date) ? `<div class="warn">이 날짜의 최저시급(${minWage(v.date).toLocaleString()}원)보다 시급이 낮아요</div>` : ''}`;
+}
+function openRuleEnd(rid) {
+  const r = S.repeats.find(x => x.id === rid); if (!r) return;
+  const j = jobById(r.jobId);
+  openSheet(`<h2>반복 근무 끝내기</h2>
+    <div class="payinfo">${esc(j.name)} · 매주 ${WK[parseYMD(r.from).getDay()]}요일 ${r.start}~${r.end}<br><small>${r.from.replace(/-/g, '.')}부터</small></div>
+    <label class="f"><span>마지막 근무일</span><input type="date" id="rUntil" value="${r.until || ymd(now)}" min="${r.from}"></label>
+    <div class="note" style="margin:-4px 0 10px">이날 이후의 반복 근무만 사라지고, 지난 기록은 그대로 남아요.</div>
+    <div class="btns">${r.until ? `<button class="ghost" data-act="ruleForever" data-id="${esc(r.id)}">다시 계속 반복</button>` : ''}<button class="primary" data-act="ruleUntil" data-id="${esc(r.id)}">저장</button></div>
+    <button class="ghost danger block" style="margin-top:14px" data-act="ruleDelete" data-id="${esc(r.id)}">반복 근무 통째로 삭제 (지난 기록 포함)</button>`);
 }
 function openJob(id) {
   const j = id ? jobById(id) : null;
@@ -400,33 +495,35 @@ function openJob(id) {
   openSheet(`<h2>${j ? '알바 수정' : '알바 추가'}</h2>
     <label class="f"><span>이름</span><input id="jName" value="${esc(v.name)}" maxlength="30" placeholder="예: 편의점"></label>
     <div class="f"><span>색상</span><div class="colors" id="jColors">${PALETTE.map(c => `<button type="button" data-color="${c}" class="${c === v.color ? 'sel' : ''}" style="background:${c}" aria-label="색상"></button>`).join('')}</div></div>
-    <label class="f"><span>시급 (원)</span><input type="number" inputmode="numeric" id="jWage" value="${v.wage}" step="10"></label>
+    <label class="f"><span>시급 (원)</span>${numInput('jWage', v.wage, '10700')}</label>
     <div class="note" id="jWageNote" style="margin:-4px 0 10px"></div>
     <div class="row2">
       <label class="f"><span>급여일</span><select id="jPayday">${Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}" ${v.payday === i + 1 ? 'selected' : ''}>매월 ${i + 1}일</option>`).join('')}</select></label>
-      <label class="f"><span>지급 시점</span><select id="jPayNext"><option value="1" ${v.payNext ? 'selected' : ''}>다음 달 (익월)</option><option value="0" ${!v.payNext ? 'selected' : ''}>그 달 (당월)</option></select></label>
+      <label class="f"><span>언제 일한 돈?</span><select id="jPayNext"><option value="1" ${v.payNext ? 'selected' : ''}>지난달 일한 돈</option><option value="0" ${!v.payNext ? 'selected' : ''}>이번 달 일한 돈</option></select></label>
     </div>
-    <label class="f"><span>공제</span><select id="jDeduct">
-      <option value="none" ${v.deduct === 'none' ? 'selected' : ''}>공제 없음</option>
-      <option value="33" ${v.deduct === '33' ? 'selected' : ''}>3.3% (사업소득)</option>
-      <option value="ins" ${v.deduct === 'ins' ? 'selected' : ''}>4대보험</option></select></label>
-    ${toggle('jSize5', v.size5, '5인 이상 사업장', '켜면 야간·연장·휴일 가산수당 적용')}
-    ${toggle('jJuhyu', v.juhyu, '주휴수당 적용', '주 15시간 이상·개근 시 자동 계산')}
-    <div class="sec-title" style="margin-top:12px">근무 추가할 때 기본값</div>
-    <div class="row2"><label class="f"><span>출근</span><input type="time" id="jStart" value="${v.defStart}"></label><label class="f"><span>퇴근</span><input type="time" id="jEnd" value="${v.defEnd}"></label></div>
-    <label class="f"><span>휴게시간 (분)</span><input type="number" inputmode="numeric" id="jBreak" value="${v.breakMin}" min="0" step="10"></label>
+    <label class="f"><span>월급에서 떼는 돈</span><select id="jDeduct">
+      <option value="none" ${v.deduct === 'none' ? 'selected' : ''}>안 떼요 (일한 만큼 그대로)</option>
+      <option value="33" ${v.deduct === '33' ? 'selected' : ''}>3.3% 떼요</option>
+      <option value="ins" ${v.deduct === 'ins' ? 'selected' : ''}>4대보험 떼요</option></select></label>
+    <div class="note" style="margin:-4px 0 10px">모르겠으면 급여명세서를 보거나 사장님께 "3.3% 떼세요, 4대보험이에요?"라고 물어보면 돼요.</div>
+    ${toggle('jSize5', v.size5, '직원 5명 이상인 가게', '켜면 야간·연장·휴일에 시급 1.5배')}
+    ${toggle('jJuhyu', v.juhyu, '주휴수당 받기', '주 15시간 이상, 빠진 날 없으면 자동 계산')}
+    <div class="sec-title" style="margin-top:12px">근무 추가할 때 미리 채워둘 값</div>
+    <div class="row2"><div class="f"><span>출근</span>${timeSel('jStart', v.defStart)}</div><div class="f"><span>퇴근</span>${timeSel('jEnd', v.defEnd)}</div></div>
+    <label class="f"><span>휴게시간 (분)</span>${numInput('jBreak', v.breakMin, '0')}</label>
     <div class="btns">${j ? `<button class="ghost danger" data-act="delJob" data-id="${esc(j.id)}">삭제</button>` : ''}<button class="primary" data-act="saveJob" data-id="${j ? esc(j.id) : ''}">저장</button></div>`);
-  const note = () => { const w = Number($('#jWage').value) || 0, mw = minWage(ymd(now));
-    $('#jWageNote').innerHTML = w < mw ? `<span style="color:var(--warn)">현재 최저시급 ${mw.toLocaleString()}원보다 낮아요</span>` : '최저시급: 2026년 10,320원 · 2027년 10,700원'; };
+  const note = () => { const w = digits($('#jWage').value), mw = minWage(ymd(now));
+    $('#jWageNote').innerHTML = w && w < mw ? `<span style="color:var(--warn)">현재 최저시급 ${mw.toLocaleString()}원보다 낮아요</span>` : '최저시급: 2026년 10,320원 · 2027년 10,700원'; };
   $('#jWage').addEventListener('input', note); note();
 }
+
 function openExtra(jobId) {
   const j = jobById(jobId);
   openSheet(`<h2>기타 내역 · ${esc(j.name)}</h2>
     <div class="note" style="margin:-6px 0 12px">${view.y}년 ${view.m + 1}월 급여에 반영돼요.</div>
     <label class="f"><span>종류</span><select id="xKind"><option value="plus">더하기 — 상여·식대·기타 수당 (세전에 포함)</option><option value="minus">빼기 — 가불·기타 차감 (실수령에서 차감)</option></select></label>
     <label class="f"><span>이름</span><input id="xLabel" maxlength="30" placeholder="예: 명절 상여, 가불"></label>
-    <label class="f"><span>금액 (원)</span><input type="number" inputmode="numeric" id="xAmount" step="1000" min="0"></label>
+    <label class="f"><span>금액 (원)</span>${numInput('xAmount', '', '예: 50000')}</label>
     <div class="btns"><button class="primary" data-act="saveExtra" data-id="${esc(j.id)}">저장</button></div>`);
 }
 
@@ -460,20 +557,20 @@ function sampleData() {
   const a = { id: uid(), name: '편의점', color: PALETTE[0], wage: 10320, payday: 10, payNext: true, size5: false, juhyu: true, deduct: '33', breakMin: 0, defStart: '18:00', defEnd: '23:00' };
   const b = { id: uid(), name: '카페', color: PALETTE[2], wage: 11000, payday: 25, payNext: false, size5: true, juhyu: true, deduct: 'ins', breakMin: 60, defStart: '14:00', defEnd: '23:00' };
   S.jobs.push(a, b);
-  const start = new Date(now.getFullYear(), now.getMonth() - 1, 1), end = new Date(now.getFullYear(), now.getMonth() + 2, 0);
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const ds = ymd(d), w = d.getDay();
-    if ([1, 3, 5].includes(w)) S.shifts.push({ id: uid(), jobId: a.id, date: ds, start: '18:00', end: '23:00', breakMin: 0, holiday: false, absent: false, memo: '' });
-    if (w === 6) S.shifts.push({ id: uid(), jobId: b.id, date: ds, start: '14:00', end: '23:00', breakMin: 60, holiday: false, absent: false, memo: '' });
-  }
+  const start = ymd(new Date(now.getFullYear(), now.getMonth() - 1, 1));
+  const firstOn = wd => addDays(start, (wd - parseYMD(start).getDay() + 7) % 7);
+  [1, 3, 5].forEach(wd => S.repeats.push({ id: uid(), jobId: a.id, from: firstOn(wd), until: null, start: '18:00', end: '23:00', breakMin: 0, holiday: false, skip: [] }));
+  S.repeats.push({ id: uid(), jobId: b.id, from: firstOn(6), until: null, start: '14:00', end: '23:00', breakMin: 60, holiday: false, skip: [] });
   save(); view.tab = 'cal'; render(); toast('예시 데이터를 넣었어요');
 }
+const ruleOf = s => s && S.repeats.find(r => r.id === s.ruleId);
 document.addEventListener('click', e => {
   if (e.target.id === 'overlay') return closeSheet();
   const cb = e.target.closest('#jColors button');
   if (cb) { document.querySelectorAll('#jColors button').forEach(b => b.classList.toggle('sel', b === cb)); return; }
   const el = e.target.closest('[data-act]'); if (!el) return;
   const act = el.dataset.act, id = el.dataset.id;
+  const done = msg => { save(); closeSheet(); render(); if (msg) toast(msg); };
   switch (act) {
     case 'tab': view.tab = el.dataset.tab; render(); window.scrollTo(0, 0); break;
     case 'prev': view.m--; if (view.m < 0) { view.m = 11; view.y--; } render(); break;
@@ -488,66 +585,110 @@ document.addEventListener('click', e => {
     case 'editShift': openShift(null, id); break;
     case 'saveShift': {
       const v = readShift();
-      if (!RX.date.test(v.date) || !RX.time.test(v.start) || !RX.time.test(v.end)) return toast('날짜와 시간을 입력해 주세요');
+      if (!RX.date.test(v.date)) return toast('날짜를 골라주세요');
       if (v.start === v.end) return toast('출근과 퇴근 시간이 같아요');
       if (!jobById(v.jobId)) return toast('알바를 선택해 주세요');
-      if (id) Object.assign(S.shifts.find(s => s.id === id), v);
-      else {
-        const n = Number($('#sRepeat').value) || 1, base = parseYMD(v.date);
-        for (let i = 0; i < n; i++) S.shifts.push({ ...v, id: uid(), date: ymd(new Date(base.getFullYear(), base.getMonth(), base.getDate() + 7 * i)) });
+      if (id) { Object.assign(S.shifts.find(s => s.id === id), v); return done('수정했어요'); }
+      if ($('#sRepeat').value === 'weekly') {
+        if (v.absent) return toast('결근은 반복으로 넣을 수 없어요');
+        let until = null;
+        if ($('#sEndMode').value === 'date') {
+          until = $('#sUntil').value;
+          if (!RX.date.test(until)) return toast('마지막 근무일을 골라주세요');
+          if (until < v.date) return toast('마지막 근무일이 시작일보다 빨라요');
+        }
+        S.repeats.push({ id: uid(), jobId: v.jobId, from: v.date, until, start: v.start, end: v.end, breakMin: v.breakMin, holiday: v.holiday, skip: [] });
+        return done(`매주 ${WK[parseYMD(v.date).getDay()]}요일 반복 근무를 넣었어요`);
       }
-      save(); closeSheet(); render(); toast(id ? '수정했어요' : '근무를 추가했어요'); break;
+      S.shifts.push({ ...v, id: uid() });
+      return done('근무를 추가했어요');
     }
     case 'delShift':
       if (!armed(el, '한 번 더 누르면 삭제')) return;
-      S.shifts = S.shifts.filter(s => s.id !== id); save(); closeSheet(); render(); toast('삭제했어요'); break;
+      S.shifts = S.shifts.filter(s => s.id !== id); return done('삭제했어요');
+    // 반복 근무의 하루
+    case 'occSave': { // 이날만 바꾸기: 반복에서 이날을 빼고 따로 저장
+      const s = findShift(id), rule = ruleOf(s), v = readShift(); if (!rule) return;
+      if (v.start === v.end) return toast('출근과 퇴근 시간이 같아요');
+      rule.skip.push(s.date);
+      S.shifts.push({ ...v, id: uid(), jobId: rule.jobId, date: s.date, absent: false, memo: '' });
+      return done('이날만 바꿨어요');
+    }
+    case 'occFuture': { // 이날부터 모두 바꾸기: 반복을 둘로 나눔
+      const s = findShift(id), rule = ruleOf(s), v = readShift(); if (!rule) return;
+      if (v.start === v.end) return toast('출근과 퇴근 시간이 같아요');
+      const nr = { id: uid(), jobId: rule.jobId, from: s.date, until: rule.until, start: v.start, end: v.end, breakMin: v.breakMin, holiday: v.holiday, skip: rule.skip.filter(d => d > s.date) };
+      if (s.date <= rule.from) S.repeats = S.repeats.filter(r => r !== rule); else rule.until = addDays(s.date, -1);
+      S.repeats.push(nr);
+      return done('이날부터 모두 바꿨어요');
+    }
+    case 'occSkip': {
+      if (!armed(el, '한 번 더 누르면 빼기')) return;
+      const s = findShift(id), rule = ruleOf(s); if (!rule) return;
+      rule.skip.push(s.date); return done('이날만 뺐어요');
+    }
+    case 'occEnd': {
+      if (!armed(el, '한 번 더 누르면 끝내기')) return;
+      const s = findShift(id), rule = ruleOf(s); if (!rule) return;
+      if (s.date <= rule.from) S.repeats = S.repeats.filter(r => r !== rule); else rule.until = addDays(s.date, -1);
+      return done('반복을 끝냈어요. 지난 기록은 남아 있어요');
+    }
+    // 알바 탭의 반복 근무 관리
+    case 'ruleEnd': openRuleEnd(id); break;
+    case 'ruleUntil': {
+      const r = S.repeats.find(x => x.id === id), u = $('#rUntil').value; if (!r) return;
+      if (!RX.date.test(u)) return toast('날짜를 골라주세요');
+      if (u < r.from) return toast(`${r.from.replace(/-/g, '.')} 이후로 골라주세요`);
+      r.until = u; return done('종료일을 저장했어요');
+    }
+    case 'ruleForever': { const r = S.repeats.find(x => x.id === id); if (r) r.until = null; return done('다시 계속 반복해요'); }
+    case 'ruleDelete':
+      if (!armed(el, '지난 기록까지 지워져요 · 한 번 더')) return;
+      S.repeats = S.repeats.filter(r => r.id !== id); return done('삭제했어요');
     case 'newJob': openJob(); break;
     case 'editJob': openJob(id); break;
     case 'saveJob': {
-      const name = str($('#jName').value.trim(), 30), wage = num($('#jWage').value, 0, 0, 1e6);
+      const name = str($('#jName').value.trim(), 30), wage = Math.min(1e6, digits($('#jWage').value));
       if (!name) return toast('이름을 입력해 주세요');
       if (!(wage > 0)) return toast('시급을 입력해 주세요');
       const color = (document.querySelector('#jColors .sel') || {}).dataset?.color;
       const v = { name, wage, color: RX.hex.test(color) ? color : PALETTE[0],
-        payday: Math.round(num($('#jPayday').value, 10, 1, 31)), payNext: $('#jPayNext').value === '1', deduct: $('#jDeduct').value,
+        payday: Math.round(num($('#jPayday').value, 10, 1, 31)), payNext: $('#jPayNext').value === '1',
+        deduct: ['none', '33', 'ins'].includes($('#jDeduct').value) ? $('#jDeduct').value : 'none',
         size5: $('#jSize5').checked, juhyu: $('#jJuhyu').checked,
-        defStart: RX.time.test($('#jStart').value) ? $('#jStart').value : '09:00', defEnd: RX.time.test($('#jEnd').value) ? $('#jEnd').value : '18:00',
-        breakMin: Math.round(num($('#jBreak').value, 0, 0, 1440)) };
+        defStart: readTime('jStart'), defEnd: readTime('jEnd'), breakMin: Math.min(1440, digits($('#jBreak').value)) };
       if (id) Object.assign(jobById(id), v); else S.jobs.push({ id: uid(), ...v });
-      save(); closeSheet(); render(); toast('저장했어요'); break;
+      return done('저장했어요');
     }
     case 'delJob':
       if (!armed(el, '근무 기록까지 삭제 · 한 번 더')) return;
-      S.jobs = S.jobs.filter(j => j.id !== id); S.shifts = S.shifts.filter(s => s.jobId !== id); S.extras = S.extras.filter(x => x.jobId !== id);
-      save(); closeSheet(); render(); break;
+      S.jobs = S.jobs.filter(j => j.id !== id); S.shifts = S.shifts.filter(s => s.jobId !== id);
+      S.extras = S.extras.filter(x => x.jobId !== id); S.repeats = S.repeats.filter(r => r.jobId !== id);
+      return done();
     case 'newExtra': openExtra(id); break;
     case 'saveExtra': {
-      const amount = Math.round(num($('#xAmount').value, 0, 0, 1e9));
+      const amount = Math.min(1e9, digits($('#xAmount').value));
       if (!(amount > 0)) return toast('금액을 입력해 주세요');
       S.extras.push({ id: uid(), jobId: id, month: `${view.y}-${pad(view.m + 1)}`, kind: $('#xKind').value === 'minus' ? 'minus' : 'plus', label: str($('#xLabel').value.trim(), 30) || '기타', amount });
-      save(); closeSheet(); render(); toast('추가했어요'); break;
+      return done('추가했어요');
     }
     case 'delExtra':
       if (!armed(el, '삭제?')) return;
       S.extras = S.extras.filter(x => x.id !== id); save(); render(); break;
-    case 'saveRates':
-      S.rates = { pension: num($('#rPension').value, 0, 0, 50), health: num($('#rHealth').value, 0, 0, 50), ltc: num($('#rLtc').value, 0, 0, 100), emp: num($('#rEmp').value, 0, 0, 50) };
-      save(); toast('요율을 저장했어요'); break;
-    case 'resetRates': S.rates = { ...DEFAULT_RATES }; save(); render(); toast('기본값으로 바꿨어요'); break;
     case 'exportFile': {
       const blob = new Blob([JSON.stringify(S, null, 1)], { type: 'application/json' });
       const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob); a.download = `albanote-backup-${ymd(new Date())}.json`;
+      a.href = URL.createObjectURL(blob); a.download = `알바노트-기록-${ymd(new Date())}.json`;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-      markBackup(); renderBanner(); toast('백업 파일을 만들었어요'); break;
+      markBackup(); render(); toast('기록 파일을 만들었어요'); break;
     }
     case 'importFile': $('#fileIn').value = ''; $('#fileIn').click(); break;
     case 'copyBk': {
       const ta = $('#bk'); ta.value = JSON.stringify(S);
       (navigator.clipboard ? navigator.clipboard.writeText(ta.value) : Promise.reject())
-        .then(() => { markBackup(); renderBanner(); toast('복사했어요. 메모 앱 등에 붙여넣어 보관하세요'); },
-          () => { ta.focus(); ta.select(); toast('선택된 내용을 직접 복사해 주세요'); });
+        .then(() => { markBackup(); renderBanner(); toast('복사했어요. 메모 앱에 붙여넣어 두세요'); },
+          () => { ta.focus(); ta.select(); toast('선택된 글자를 직접 복사해 주세요'); });
       break;
     }
     case 'importBk': applyImport($('#bk').value, el); break;

@@ -1,5 +1,5 @@
 // 알바노트 오프라인 캐시. 파일을 고치면 VERSION을 올려주세요.
-const VERSION = 'albanote-v1';
+const VERSION = 'albanote-v2';
 const ASSETS = ['./', './index.html', './app.js', './style.css', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
