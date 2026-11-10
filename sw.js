@@ -1,7 +1,7 @@
 // 알바노트 오프라인 캐시. 파일을 고치면 VERSION을 올려주세요.
-const VERSION = 'albanote-v2';
+const VERSION = 'albanote-v3';
 const ASSETS = ['./', './index.html', './app.js', './style.css', './manifest.webmanifest',
-  './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
+  './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png', './icons/icon-maskable-512.png'];
 
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(VERSION).then(c => c.addAll(ASSETS)));
