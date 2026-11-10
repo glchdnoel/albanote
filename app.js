@@ -394,7 +394,7 @@ function openDay(ds) {
   pays.forEach(p => h += `<div class="payinfo">💰 <b>${esc(p.job.name)}</b> 급여일 · ${p.month}월분 예상 ${won(p.net)}</div>`);
   if (d.getDay() === 0) {
     const mon = new Date(d.getFullYear(), d.getMonth(), d.getDate() - 6);
-    S.jobs.forEach(j => { const w = juhyuForWeek(j, mon); if (w) h += `<div class="payinfo" style="background:var(--card);border:1px solid var(--line)">이번 주 <b>${esc(j.name)}</b> 주휴수당 ${won(w.pay)} · ${w.reason} (${Math.round(w.hours * 10) / 10}시간)</div>`; });
+    S.jobs.forEach(j => { const w = juhyuForWeek(j, mon); if (w && w.pay > 0) h +=`<div class="payinfo" style="background:var(--card);border:1px solid var(--line)">이번 주 <b>${esc(j.name)}</b> 주휴수당 +${won(w.pay)} (주 ${Math.round(w.hours * 10) / 10}시간 근무)</div>`; });
   }
   if (!ss.length) h += '<div class="note" style="margin:6px 0 4px">이날은 근무가 없어요.</div>';
   ss.forEach(s => {
@@ -408,11 +408,10 @@ function openDay(ds) {
   h += `<button class="primary block" data-act="newShift" data-date="${ds}">+ 근무 추가</button>`;
   openSheet(h);
 }
-// 24시간제 시간 선택 (시 00~23, 분 5분 단위)
+// 24시간제 시간 선택 (시 00~23, 분 00~59)
 function timeSel(id, val) {
   const [h, m] = (RX.time.test(val) ? val : '09:00').split(':');
-  const mins = Array.from({ length: 12 }, (_, i) => pad(i * 5));
-  if (!mins.includes(m)) mins.push(m), mins.sort();
+  const mins = Array.from({ length: 60 }, (_, i) => pad(i));
   return `<div class="tsel"><select id="${id}H" aria-label="시">${Array.from({ length: 24 }, (_, i) => `<option value="${pad(i)}" ${pad(i) === h ? 'selected' : ''}>${pad(i)}시</option>`).join('')}</select>
     <select id="${id}M" aria-label="분">${mins.map(x => `<option value="${x}" ${x === m ? 'selected' : ''}>${x}분</option>`).join('')}</select></div>`;
 }
@@ -435,7 +434,7 @@ function openShift(date, id) {
   openSheet(`<h2>${s ? '근무 수정' : '근무 추가'}</h2>
     ${occ ? `<div class="payinfo">🔁 매주 ${WK[parseYMD(s.date).getDay()]}요일 반복 근무예요. 이날만 바꿀지, 이날부터 모두 바꿀지 골라주세요.</div>` : ''}
     <label class="f"><span>알바</span><select id="sJob" ${occ ? 'disabled' : ''}>${S.jobs.map(j => `<option value="${esc(j.id)}" ${j.id === v.jobId ? 'selected' : ''}>${esc(j.name)}</option>`).join('')}</select></label>
-    <label class="f"><span>날짜</span><input type="date" id="sDate" value="${v.date}" ${occ ? 'disabled' : ''}></label>
+    <label class="f"><span>날짜 <b id="sWk"></b></span><input type="date" id="sDate" value="${v.date}" ${occ ? 'disabled' : ''}></label>
     <div class="row2"><div class="f"><span>출근</span>${timeSel('sStart', v.start)}</div><div class="f"><span>퇴근</span>${timeSel('sEnd', v.end)}</div></div>
     <label class="f"><span>휴게시간 (분)</span>${numInput('sBreak', v.breakMin, '0')}</label>
     ${toggle('sHoliday', v.holiday, '휴일 근무', '5인 이상이면 시급 1.5배')}
@@ -470,6 +469,8 @@ function previewShift() {
     $('#sUntilWrap').hidden = !(weekly && $('#sEndMode').value === 'date');
   }
   const v = readShift(), j = jobById(v.jobId);
+  const wk = $('#sWk');
+  if (wk) wk.textContent = RX.date.test(v.date) ? `· ${Number(v.date.slice(5, 7))}월 ${Number(v.date.slice(8))}일 ${WK[parseYMD(v.date).getDay()]}요일` : '';
   if (!RX.date.test(v.date)) { el.textContent = '날짜를 골라주세요'; return; }
   if (v.start === v.end) { el.textContent = '출근과 퇴근 시간이 같아요'; return; }
   if (v.absent) { el.innerHTML = '결근 처리 · <b>0원</b>'; return; }
@@ -499,16 +500,16 @@ function openJob(id) {
     <div class="note" id="jWageNote" style="margin:-4px 0 10px"></div>
     <div class="row2">
       <label class="f"><span>급여일</span><select id="jPayday">${Array.from({ length: 31 }, (_, i) => `<option value="${i + 1}" ${v.payday === i + 1 ? 'selected' : ''}>매월 ${i + 1}일</option>`).join('')}</select></label>
-      <label class="f"><span>언제 일한 돈?</span><select id="jPayNext"><option value="1" ${v.payNext ? 'selected' : ''}>지난달 일한 돈</option><option value="0" ${!v.payNext ? 'selected' : ''}>이번 달 일한 돈</option></select></label>
+      <label class="f"><span>지급 시점</span><select id="jPayNext"><option value="1" ${v.payNext ? 'selected' : ''}>다음 달 (익월)</option><option value="0" ${!v.payNext ? 'selected' : ''}>그 달 (당월)</option></select></label>
     </div>
-    <label class="f"><span>월급에서 떼는 돈</span><select id="jDeduct">
-      <option value="none" ${v.deduct === 'none' ? 'selected' : ''}>안 떼요 (일한 만큼 그대로)</option>
-      <option value="33" ${v.deduct === '33' ? 'selected' : ''}>3.3% 떼요</option>
-      <option value="ins" ${v.deduct === 'ins' ? 'selected' : ''}>4대보험 떼요</option></select></label>
-    <div class="note" style="margin:-4px 0 10px">모르겠으면 급여명세서를 보거나 사장님께 "3.3% 떼세요, 4대보험이에요?"라고 물어보면 돼요.</div>
+    <label class="f"><span>공제</span><select id="jDeduct">
+      <option value="none" ${v.deduct === 'none' ? 'selected' : ''}>공제 없음</option>
+      <option value="33" ${v.deduct === '33' ? 'selected' : ''}>3.3% (사업소득)</option>
+      <option value="ins" ${v.deduct === 'ins' ? 'selected' : ''}>4대보험</option></select></label>
     ${toggle('jSize5', v.size5, '직원 5명 이상인 가게', '켜면 야간·연장·휴일에 시급 1.5배')}
     ${toggle('jJuhyu', v.juhyu, '주휴수당 받기', '주 15시간 이상, 빠진 날 없으면 자동 계산')}
-    <div class="sec-title" style="margin-top:12px">근무 추가할 때 미리 채워둘 값</div>
+    <div class="sec-title" style="margin-top:12px">기본 근무시간</div>
+    <div class="note" style="margin:-4px 0 10px">근무를 추가할 때 자동으로 입력돼요</div>
     <div class="row2"><div class="f"><span>출근</span>${timeSel('jStart', v.defStart)}</div><div class="f"><span>퇴근</span>${timeSel('jEnd', v.defEnd)}</div></div>
     <label class="f"><span>휴게시간 (분)</span>${numInput('jBreak', v.breakMin, '0')}</label>
     <div class="btns">${j ? `<button class="ghost danger" data-act="delJob" data-id="${esc(j.id)}">삭제</button>` : ''}<button class="primary" data-act="saveJob" data-id="${j ? esc(j.id) : ''}">저장</button></div>`);
