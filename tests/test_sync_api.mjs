@@ -1,5 +1,5 @@
 // 실행: node tests/test_sync_api.mjs  (Node 22.5 이상, 저장소 최상위에서)
-// 진짜 RSA 키로 Access 토큰을 만들어 서버 함수를 검사하고, 맥·폰 두 기기 동기화를 흉내 냄
+// 동기화 코드 확인과 저장 규칙을 검사하고, 맥·폰 두 기기 동기화를 흉내 냄
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { createRequire } from 'node:module';
@@ -7,7 +7,7 @@ import { onRequest } from '../functions/api/sync.js';
 const require = createRequire(import.meta.url);
 const { merge, same } = require('../merge.js');
 
-const TEAM = 'testteam', AUD = 'aud-123', EMAIL = 'me@example.com', ORIGIN = 'https://albanote.pages.dev';
+const ORIGIN = 'https://albanote.pages.dev';
 
 // --- 가짜 D1 (실제 SQLite 사용) ---
 function fakeD1() {
@@ -24,28 +24,16 @@ function fakeD1() {
   };
 }
 
-// --- Access 토큰 만들기 ---
-const b64u = buf => Buffer.from(buf).toString('base64url');
-const pair = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign', 'verify']);
-const other = await crypto.subtle.generateKey({ name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['sign', 'verify']);
-const pub = { ...(await crypto.subtle.exportKey('jwk', pair.publicKey)), kid: 'k1' };
-globalThis.fetch = async url => {
-  assert.equal(String(url), `https://${TEAM}.cloudflareaccess.com/cdn-cgi/access/certs`);
-  return new Response(JSON.stringify({ keys: [pub] }), { headers: { 'content-type': 'application/json' } });
-};
-async function token(over = {}, key = pair.privateKey, head = {}) {
-  const now = Math.floor(Date.now() / 1000);
-  const h = b64u(JSON.stringify({ alg: 'RS256', kid: 'k1', ...head }));
-  const p = b64u(JSON.stringify({ iss: `https://${TEAM}.cloudflareaccess.com`, aud: [AUD], email: EMAIL, exp: now + 3600, iat: now, nbf: now, ...over }));
-  const sig = await crypto.subtle.sign('RSASSA-PKCS1-v1_5', key, new TextEncoder().encode(h + '.' + p));
-  return `${h}.${p}.${b64u(sig)}`;
-}
+// --- 동기화 코드 ---
+const CODE = 'Abcdefghij_klmnopqrst-uvwxyz0123456789ABCDEFG'; // 테스트용 43글자
+const hex = async t => [...new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(t)))].map(b => b.toString(16).padStart(2, '0')).join('');
+const HASH = await hex(CODE);
 
 const DB = fakeD1();
-const env = { ACCESS_TEAM_NAME: TEAM, ACCESS_AUD: AUD, ALLOWED_EMAIL: 'Me@Example.com', DB };
-async function call(method, { tok, body, origin = ORIGIN, type = 'application/json', envOver = {} } = {}) {
+const env = { SYNC_CODE_HASH: HASH.toUpperCase(), DB };
+async function call(method, { auth, body, origin = ORIGIN, type = 'application/json', envOver = {} } = {}) {
   const headers = {};
-  if (tok !== null) headers['Cf-Access-Jwt-Assertion'] = tok ?? await token();
+  if (auth !== null) headers['Authorization'] = auth ?? `Bearer ${CODE}`;
   if (method === 'PUT') { headers['Origin'] = origin; headers['Content-Type'] = type; }
   const req = new Request(`${ORIGIN}/api/sync`, { method, headers, body: body === undefined ? undefined : (typeof body === 'string' ? body : JSON.stringify(body)) });
   const res = await onRequest({ request: req, env: { ...env, ...envOver } });
@@ -56,20 +44,17 @@ const doc = shifts => ({ jobs: [{ id: 'j1', name: '카페', wage: 10500 }], shif
 const sh = (id, memo = '') => ({ id, jobId: 'j1', date: '2026-11-15', start: '09:00', end: '17:00', memo });
 
 // --- 막아야 하는 것 ---
-await t('토큰 없음 → 401', async () => assert.equal((await call('GET', { tok: null })).status, 401));
-await t('다른 키로 서명한 토큰 → 401', async () => assert.equal((await call('GET', { tok: await token({}, other.privateKey) })).status, 401));
-await t('서명 위조(내용만 바꿈) → 401', async () => {
-  const [h, , s] = (await token()).split('.');
-  const fake = b64u(JSON.stringify({ iss: `https://${TEAM}.cloudflareaccess.com`, aud: [AUD], email: EMAIL, exp: 9e9 }));
-  assert.equal((await call('GET', { tok: `${h}.${fake}.${s}` })).status, 401);
+await t('코드 없음 → 401', async () => assert.equal((await call('GET', { auth: null })).status, 401));
+await t('틀린 코드 → 401', async () => assert.equal((await call('GET', { auth: `Bearer ${CODE.slice(0, -1)}X` })).status, 401));
+await t('해시값 자체를 코드로 보내도 → 401', async () => assert.equal((await call('GET', { auth: `Bearer ${HASH}` })).status, 401));
+await t('짧은 코드·이상한 형식 → 401', async () => {
+  for (const a of ['Bearer abc', `Basic ${CODE}`, `Bearer ${CODE}%`, `Bearer ${CODE} x`, CODE]) assert.equal((await call('GET', { auth: a })).status, 401, a);
 });
-await t('alg none 토큰 → 401', async () => assert.equal((await call('GET', { tok: await token({}, pair.privateKey, { alg: 'none' }) })).status, 401));
-await t('다른 앱용 토큰(aud 다름) → 401', async () => assert.equal((await call('GET', { tok: await token({ aud: ['other'] }) })).status, 401));
-await t('다른 팀 발급(iss 다름) → 401', async () => assert.equal((await call('GET', { tok: await token({ iss: 'https://evil.cloudflareaccess.com' }) })).status, 401));
-await t('만료된 토큰 → 401', async () => assert.equal((await call('GET', { tok: await token({ exp: Math.floor(Date.now() / 1000) - 120 }) })).status, 401));
-await t('허용 안 된 이메일 → 403', async () => assert.equal((await call('GET', { tok: await token({ email: 'friend@example.com' }) })).status, 403));
+await t('서버 등록값이 해시 형식이 아니면(코드를 그대로 넣는 실수 등) → 500', async () => {
+  for (const v of [CODE, 'abc', HASH.slice(1)]) assert.equal((await call('GET', { envOver: { SYNC_CODE_HASH: v } })).status, 500, v);
+});
 await t('설정값 빠짐 → 500, 데이터 안 줌', async () => {
-  for (const k of ['ACCESS_TEAM_NAME', 'ACCESS_AUD', 'ALLOWED_EMAIL', 'DB']) {
+  for (const k of ['SYNC_CODE_HASH', 'DB']) {
     const r = await call('GET', { envOver: { [k]: undefined } });
     assert.equal(r.status, 500, k); assert.equal(r.body.data, undefined);
   }
@@ -102,10 +87,6 @@ await t('수정 전 상태가 history에 하루 1개 보관됨', async () => {
   await call('PUT', { body: { rev: 2, data: doc([]) } });
   const rows = DB.raw.prepare('SELECT rev, data FROM history').all();
   assert.equal(rows.length, 1); assert.equal(rows[0].rev, 1);
-});
-await t('다른 이메일 데이터와 섞이지 않음(이메일 대소문자 무시)', async () => {
-  const rows = DB.raw.prepare('SELECT owner FROM docs').all();
-  assert.deepEqual(rows.map(r => r.owner), ['me@example.com']);
 });
 
 // --- 맥·폰 동기화 흉내 (app.js의 syncNow와 같은 순서) ---

@@ -73,10 +73,14 @@ let S = load() || emptyData();
 function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { storageOK = false; renderBanner(); } }
 function save() { saveLocal(); scheduleSync(); }
 
-/* ---------- 기기 간 동기화 (albanote.pages.dev에서만, Cloudflare Access 로그인한 본인만) ---------- */
+/* ---------- 기기 간 동기화 (albanote.pages.dev에서만, 동기화 코드를 넣은 기기만) ---------- */
 const SYNC_ON = location.hostname === 'albanote.pages.dev';
 const BASE_KEY = 'albanote.base.v1'; // 마지막으로 서버와 맞춘 상태 {rev, data}
-const SYNC = { state: SYNC_ON ? 'wait' : 'off', at: null, busy: false, again: false, timer: null, pendingRender: false };
+const CODE_KEY = 'albanote.synccode.v1'; // 이 기기에만 저장. 서버에는 코드의 해시값만 있음
+const CODE_RX = /^[A-Za-z0-9_-]{40,100}$/;
+function getCode() { try { const c = localStorage.getItem(CODE_KEY); return c && CODE_RX.test(c) ? c : null; } catch (_) { return null; } }
+function setCode(c) { try { if (c) localStorage.setItem(CODE_KEY, c); else localStorage.removeItem(CODE_KEY); } catch (_) {} }
+const SYNC = { state: SYNC_ON ? (getCode() ? 'wait' : 'nocode') : 'off', at: null, busy: false, again: false, timer: null, pendingRender: false };
 function loadBase() {
   try { const b = JSON.parse(localStorage.getItem(BASE_KEY)); if (b && Number.isInteger(b.rev) && b.rev >= 0) return { rev: b.rev, data: clean(b.data) }; } catch (_) {}
   return null;
@@ -87,12 +91,11 @@ function scheduleSync(ms = 1500) {
   clearTimeout(SYNC.timer); SYNC.timer = setTimeout(syncNow, ms);
 }
 async function syncApi(method, body) {
-  const res = await fetch('/api/sync', {
-    method, credentials: 'same-origin', redirect: 'manual', cache: 'no-store',
-    headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined
-  });
-  // 로그인 기간이 끝나면 Access가 로그인 화면으로 돌려보냄
-  if (res.type === 'opaqueredirect' || res.status === 401 || res.status === 403) throw new Error('login');
+  const code = getCode(); if (!code) throw new Error('nocode');
+  const headers = { Authorization: 'Bearer ' + code };
+  if (body) headers['Content-Type'] = 'application/json';
+  const res = await fetch('/api/sync', { method, cache: 'no-store', credentials: 'omit', headers, body: body ? JSON.stringify(body) : undefined });
+  if (res.status === 401) throw new Error('badcode');
   if ((res.status !== 200 && res.status !== 409) || !(res.headers.get('content-type') || '').includes('application/json')) throw new Error('server');
   return { status: res.status, body: await res.json() };
 }
@@ -103,6 +106,7 @@ function setSync(state) {
 async function syncNow() {
   if (!SYNC_ON) return;
   if (SYNC.busy) { SYNC.again = true; return; }
+  if (!getCode()) { setSync('nocode'); return; }
   if (!navigator.onLine) { setSync('offline'); return; }
   SYNC.busy = true; SYNC.again = false;
   try {
@@ -122,7 +126,7 @@ async function syncNow() {
     }
     setSync('ok');
   } catch (e) {
-    setSync(e.message === 'login' ? 'login' : navigator.onLine ? 'error' : 'offline');
+    setSync(['nocode', 'badcode'].includes(e.message) ? e.message : navigator.onLine ? 'error' : 'offline');
   } finally {
     SYNC.busy = false;
     if (SYNC.again) scheduleSync(300);
@@ -133,7 +137,8 @@ const SYNC_TEXT = {
   wait: '동기화 준비 중이에요.',
   ok: '맥북·폰과 동기화됐어요.',
   offline: '인터넷이 끊겨 있어요. 기록은 이 기기에 저장되고, 연결되면 자동으로 맞춰요.',
-  login: '로그인 기간이 끝나서 동기화가 멈췄어요. 앱을 새로고침하거나 다시 열면 로그인 화면이 나와요.',
+  nocode: '이 기기에는 아직 동기화 코드가 없어요. 아래에 코드를 넣어 주세요. 처음이라면 새 코드를 만들면 돼요.',
+  badcode: '동기화 코드가 맞지 않아요. 코드를 다시 넣어 주세요. (서버에 등록한 코드가 바뀌었을 수 있어요)',
   error: '서버와 연결이 안 돼요. 기록은 이 기기에 저장되고, 잠시 뒤 다시 시도해요.'
 };
 // 브라우저가 저장공간을 임의로 지우지 않도록 요청
@@ -282,7 +287,7 @@ function render() {
 function renderBanner() {
   let h = '';
   if (!storageOK) h = '<div class="warn">이 브라우저에서는 데이터 저장이 막혀 있어요. 창을 닫으면 입력한 내용이 사라지니, 설정 › 기록 보관하기에서 저장해 두세요.</div>';
-  else if (SYNC.state === 'login') h = `<div class="warn">${SYNC_TEXT.login}</div>`;
+  else if (SYNC.state === 'badcode') h = `<div class="warn">${SYNC_TEXT.badcode} 설정 › 기기 간 동기화</div>`;
   else if (S.shifts.length || S.repeats.length) {
     const days = S.lastBackup ? (now - parseYMD(S.lastBackup)) / 864e5 : Infinity;
     if (days > BACKUP_REMIND_DAYS) h = `<div class="warn">${S.lastBackup ? `마지막 백업이 ${Math.floor(days)}일 전이에요.` : '아직 백업한 적이 없어요.'} 설정 › 기록 보관하기에서 파일로 저장해 두세요.</div>`;
@@ -397,13 +402,29 @@ function renderJobs() {
   }
   return h;
 }
+function syncControls() {
+  if (SYNC.state === 'nocode' || SYNC.state === 'badcode') return `
+    <label class="f"><input id="syncCode" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="동기화 코드 붙여넣기"></label>
+    <button class="primary block" data-act="saveCode">코드 저장하고 동기화</button>
+    <button class="ghost block" style="margin-top:8px" data-act="newCode">새 코드 만들기 (처음 한 번만)</button>`;
+  return `<button class="ghost block" data-act="syncNow">지금 동기화</button>
+    <button class="ghost block" style="margin-top:8px" data-act="forgetCode">이 기기에서 코드 지우기</button>`;
+}
+// 동기화 코드: 32바이트 무작위 → 43글자. 이 브라우저 안에서만 만들어지고 서버·AI에는 해시값만 감
+let pendingCode = null;
+async function makeCode() {
+  const b = crypto.getRandomValues(new Uint8Array(32));
+  const code = btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const h = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(code));
+  return { code, hash: [...new Uint8Array(h)].map(x => x.toString(16).padStart(2, '0')).join('') };
+}
 function renderSettings() {
   const rate = (r, y) => `<div class="r"><span>${y}년</span><span>국민연금 ${r.pension}% · 건강 ${r.health}% · 고용 ${r.emp}%</span></div>`;
   return `
   <div class="sec-title">기기 간 동기화</div>
   <div class="card">
     <div class="note" style="margin:0 0 10px;font-size:13.5px;color:var(--ink)">${esc(SYNC_TEXT[SYNC.state])}${SYNC.state === 'ok' && SYNC.at ? ` <span style="color:var(--muted)">(${pad(SYNC.at.getHours())}:${pad(SYNC.at.getMinutes())})</span>` : ''}</div>
-    ${SYNC_ON ? '<button class="ghost block" data-act="syncNow">지금 동기화</button>' : ''}
+    ${SYNC_ON ? syncControls() : ''}
   </div>
   <div class="sec-title">기록 보관하기</div>
   <div class="card">
@@ -766,6 +787,37 @@ document.addEventListener('click', e => {
     case 'importBk': applyImport($('#bk').value, el); break;
     case 'confirmImport': if (pendingImport) { finishImport(pendingImport); pendingImport = null; } break;
     case 'closeSheet': closeSheet(); break;
+    case 'newCode':
+      makeCode().then(({ code, hash }) => {
+        pendingCode = code;
+        openSheet(`<h2>새 동기화 코드</h2>
+          <div class="note" style="font-size:13.5px;color:var(--ink)">① <b>동기화 코드</b>는 맥의 <b>'암호'</b> 앱에 새 암호로 저장해 두세요(아이폰에도 자동으로 옮겨져요). <b>AI나 다른 사람에게 절대 보여주지 마세요.</b></div>
+          <label class="f"><textarea id="ncCode" readonly>${esc(code)}</textarea></label>
+          <button class="ghost block" data-act="copyNc" data-src="ncCode">동기화 코드 복사</button>
+          <div class="note" style="font-size:13.5px;color:var(--ink);margin-top:14px">② <b>서버 등록용 값</b>은 코드를 거꾸로 알아낼 수 없는 값이에요. Aside에게는 이 값만 알려주면 돼요.</div>
+          <label class="f"><textarea id="ncHash" readonly>${esc(hash)}</textarea></label>
+          <button class="ghost block" data-act="copyNc" data-src="ncHash">서버 등록용 값 복사</button>
+          <div class="btns"><button class="ghost" data-act="closeSheet">취소</button><button class="primary" data-act="useNewCode">코드 저장했어요</button></div>`);
+      }, () => toast('이 브라우저에서는 코드를 만들 수 없어요'));
+      break;
+    case 'copyNc': {
+      const v = $('#' + el.dataset.src).value;
+      navigator.clipboard.writeText(v).then(() => toast('복사했어요'), () => { $('#' + el.dataset.src).select(); toast('길게 눌러 복사해 주세요'); });
+      break;
+    }
+    case 'useNewCode':
+      if (pendingCode) { setCode(pendingCode); pendingCode = null; }
+      closeSheet(); SYNC.state = 'wait'; render(); syncNow(); toast('이 기기에 코드를 저장했어요');
+      break;
+    case 'saveCode': {
+      const c = ($('#syncCode').value || '').replace(/\s+/g, '');
+      if (!CODE_RX.test(c)) { toast('코드 형식이 맞지 않아요'); break; }
+      setCode(c); SYNC.state = 'wait'; render(); syncNow();
+      break;
+    }
+    case 'forgetCode':
+      setCode(null); SYNC.state = 'nocode'; render(); toast('이 기기에서 코드를 지웠어요. 기록은 그대로 있어요');
+      break;
     case 'syncNow': syncNow().then(() => toast(SYNC.state === 'ok' ? '동기화했어요' : SYNC_TEXT[SYNC.state])); break;
     case 'sample': sampleData(); break;
     case 'wipe':
