@@ -70,7 +70,72 @@ function load() {
   } catch (e) { if (e instanceof DOMException) storageOK = false; return null; }
 }
 let S = load() || emptyData();
-function save() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { storageOK = false; renderBanner(); } }
+function saveLocal() { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch (e) { storageOK = false; renderBanner(); } }
+function save() { saveLocal(); scheduleSync(); }
+
+/* ---------- 기기 간 동기화 (albanote.pages.dev에서만, Cloudflare Access 로그인한 본인만) ---------- */
+const SYNC_ON = location.hostname === 'albanote.pages.dev';
+const BASE_KEY = 'albanote.base.v1'; // 마지막으로 서버와 맞춘 상태 {rev, data}
+const SYNC = { state: SYNC_ON ? 'wait' : 'off', at: null, busy: false, again: false, timer: null, pendingRender: false };
+function loadBase() {
+  try { const b = JSON.parse(localStorage.getItem(BASE_KEY)); if (b && Number.isInteger(b.rev) && b.rev >= 0) return { rev: b.rev, data: clean(b.data) }; } catch (_) {}
+  return null;
+}
+function saveBase(b) { try { localStorage.setItem(BASE_KEY, JSON.stringify(b)); } catch (_) {} }
+function scheduleSync(ms = 1500) {
+  if (!SYNC_ON) return;
+  clearTimeout(SYNC.timer); SYNC.timer = setTimeout(syncNow, ms);
+}
+async function syncApi(method, body) {
+  const res = await fetch('/api/sync', {
+    method, credentials: 'same-origin', redirect: 'manual', cache: 'no-store',
+    headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined
+  });
+  // 로그인 기간이 끝나면 Access가 로그인 화면으로 돌려보냄
+  if (res.type === 'opaqueredirect' || res.status === 401 || res.status === 403) throw new Error('login');
+  if ((res.status !== 200 && res.status !== 409) || !(res.headers.get('content-type') || '').includes('application/json')) throw new Error('server');
+  return { status: res.status, body: await res.json() };
+}
+function setSync(state) {
+  const was = SYNC.state; SYNC.state = state; if (state === 'ok') SYNC.at = new Date();
+  if (was !== state || view.tab === 'set') { if ($('#overlay').classList.contains('open')) SYNC.pendingRender = true; else render(); }
+}
+async function syncNow() {
+  if (!SYNC_ON) return;
+  if (SYNC.busy) { SYNC.again = true; return; }
+  if (!navigator.onLine) { setSync('offline'); return; }
+  SYNC.busy = true; SYNC.again = false;
+  try {
+    for (let tries = 0; tries < 4; tries++) {
+      const remote = (await syncApi('GET')).body;
+      const rdata = remote.data ? clean(remote.data) : emptyData();
+      const base = loadBase();
+      const merged = clean(AlbaMerge.merge(base && base.data, clean(S), rdata));
+      if (!AlbaMerge.same(merged, S)) {
+        S = merged; saveLocal();
+        if ($('#overlay').classList.contains('open')) SYNC.pendingRender = true; else render();
+      }
+      if (remote.data && AlbaMerge.same(merged, rdata)) { saveBase({ rev: remote.rev, data: merged }); break; }
+      const put = await syncApi('PUT', { rev: remote.rev, data: merged });
+      if (put.status === 200) { saveBase({ rev: put.body.rev, data: merged }); break; }
+      // 409: 그 사이 다른 기기가 저장함 → 다시 받아서 합치기
+    }
+    setSync('ok');
+  } catch (e) {
+    setSync(e.message === 'login' ? 'login' : navigator.onLine ? 'error' : 'offline');
+  } finally {
+    SYNC.busy = false;
+    if (SYNC.again) scheduleSync(300);
+  }
+}
+const SYNC_TEXT = {
+  off: '이 주소에서는 동기화를 쓰지 않아요. albanote.pages.dev에서 열어주세요.',
+  wait: '동기화 준비 중이에요.',
+  ok: '맥북·폰과 동기화됐어요.',
+  offline: '인터넷이 끊겨 있어요. 기록은 이 기기에 저장되고, 연결되면 자동으로 맞춰요.',
+  login: '로그인 기간이 끝나서 동기화가 멈췄어요. 앱을 새로고침하거나 다시 열면 로그인 화면이 나와요.',
+  error: '서버와 연결이 안 돼요. 기록은 이 기기에 저장되고, 잠시 뒤 다시 시도해요.'
+};
 // 브라우저가 저장공간을 임의로 지우지 않도록 요청
 try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch (_) {}
 
@@ -217,6 +282,7 @@ function render() {
 function renderBanner() {
   let h = '';
   if (!storageOK) h = '<div class="warn">이 브라우저에서는 데이터 저장이 막혀 있어요. 창을 닫으면 입력한 내용이 사라지니, 설정 › 기록 보관하기에서 저장해 두세요.</div>';
+  else if (SYNC.state === 'login') h = `<div class="warn">${SYNC_TEXT.login}</div>`;
   else if (S.shifts.length || S.repeats.length) {
     const days = S.lastBackup ? (now - parseYMD(S.lastBackup)) / 864e5 : Infinity;
     if (days > BACKUP_REMIND_DAYS) h = `<div class="warn">${S.lastBackup ? `마지막 백업이 ${Math.floor(days)}일 전이에요.` : '아직 백업한 적이 없어요.'} 설정 › 기록 보관하기에서 파일로 저장해 두세요.</div>`;
@@ -334,11 +400,16 @@ function renderJobs() {
 function renderSettings() {
   const rate = (r, y) => `<div class="r"><span>${y}년</span><span>국민연금 ${r.pension}% · 건강 ${r.health}% · 고용 ${r.emp}%</span></div>`;
   return `
+  <div class="sec-title">기기 간 동기화</div>
+  <div class="card">
+    <div class="note" style="margin:0 0 10px;font-size:13.5px;color:var(--ink)">${esc(SYNC_TEXT[SYNC.state])}${SYNC.state === 'ok' && SYNC.at ? ` <span style="color:var(--muted)">(${pad(SYNC.at.getHours())}:${pad(SYNC.at.getMinutes())})</span>` : ''}</div>
+    ${SYNC_ON ? '<button class="ghost block" data-act="syncNow">지금 동기화</button>' : ''}
+  </div>
   <div class="sec-title">기록 보관하기</div>
   <div class="card">
     <div class="note" style="margin:0 0 12px;font-size:13.5px;color:var(--ink)">
-      입력한 알바·근무 기록은 <b>이 폰 안에만</b> 저장돼요. 폰을 바꾸거나 Safari 기록을 지우면 사라질 수 있어요.<br><br>
-      가끔 <b>기록 파일로 저장하기</b>를 눌러 아이폰 '파일' 앱에 보관해 두면, 나중에 <b>저장한 파일로 되살리기</b>로 그대로 복구할 수 있어요.
+      ${SYNC_ON ? '기록은 이 기기와 동기화 서버에 저장돼요. 혹시 모를 실수에 대비해' : '입력한 알바·근무 기록은 <b>이 기기 안에만</b> 저장돼요. 기기를 바꾸거나 Safari 기록을 지우면 사라질 수 있으니'}
+      가끔 <b>기록 파일로 저장하기</b>를 눌러 카카오톡 나와의 채팅이나 메일로 보관해 두면, 나중에 <b>저장한 파일로 되살리기</b>로 그대로 복구할 수 있어요.
     </div>
     <button class="primary block" data-act="exportFile">기록 파일로 저장하기</button>
     <button class="ghost block" style="margin-top:8px" data-act="importFile">저장한 파일로 되살리기</button>
@@ -382,7 +453,7 @@ function emptyJobs() {
 
 /* ---------- 시트 ---------- */
 function openSheet(html) { $('#sheet').innerHTML = '<div class="grab"></div>' + html; $('#overlay').classList.add('open'); }
-function closeSheet() { $('#overlay').classList.remove('open'); }
+function closeSheet() { $('#overlay').classList.remove('open'); if (SYNC.pendingRender) { SYNC.pendingRender = false; render(); } }
 function toggle(id, on, label, sub) {
   return `<div class="tg"><span class="lbl">${label}${sub ? `<small>${sub}</small>` : ''}</span><label class="sw"><input type="checkbox" id="${id}" ${on ? 'checked' : ''}><span></span></label></div>`;
 }
@@ -695,6 +766,7 @@ document.addEventListener('click', e => {
     case 'importBk': applyImport($('#bk').value, el); break;
     case 'confirmImport': if (pendingImport) { finishImport(pendingImport); pendingImport = null; } break;
     case 'closeSheet': closeSheet(); break;
+    case 'syncNow': syncNow().then(() => toast(SYNC.state === 'ok' ? '동기화했어요' : SYNC_TEXT[SYNC.state])); break;
     case 'sample': sampleData(); break;
     case 'wipe':
       if (!armed(el, '정말 모두 지울까요? 한 번 더')) return;
@@ -709,6 +781,15 @@ $('#fileIn').addEventListener('change', e => {
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeSheet(); });
 
 render();
+
+// 동기화: 열 때, 앱으로 돌아올 때, 인터넷이 다시 연결될 때
+if (SYNC_ON) {
+  syncNow();
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') syncNow(); });
+  window.addEventListener('online', () => syncNow());
+  window.addEventListener('offline', () => setSync('offline'));
+  setInterval(() => { if (document.visibilityState === 'visible' && SYNC.state === 'error') syncNow(); }, 60000);
+}
 
 // 오프라인 지원 (https에서만)
 if ('serviceWorker' in navigator && location.protocol === 'https:') {
